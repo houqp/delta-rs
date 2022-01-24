@@ -88,29 +88,41 @@ impl S3LockClient for DynamoDbLockClient {
                     &data.source,
                     &data.destination
                 );
-            }
 
-            let mut rename_result = s3.unsafe_rename_obj(&data.source, &data.destination).await;
+                let rename_result = s3.unsafe_rename_obj(&data.source, &data.destination).await;
 
-            if lock.acquired_expired_lock {
                 match rename_result {
-                    // AlreadyExists when the stale rename is done, but the lock not released
-                    // NotFound when the source file of rename is missing
+                    // AlreadyExists happens when the stale rename has already been repaired, but
+                    // the lock not released.
+                    //
+                    // NotFound happens when the source file of rename is missing because previous
+                    // repair cleaned it up.
+                    //
+                    // We are safe to proceed in both cases.
                     Err(StorageError::AlreadyExists(_)) | Err(StorageError::NotFound) => (),
-                    _ => rename_result?,
+                    // Repair failed, exit without releasing the lock so it can be expired and
+                    // grabbed by the next worker to retry the repair.
+                    _ => {
+                        log::error!("Could not repair lock");
+                        rename_result?
+                    }
                 }
 
-                // If we acquired expired lock then the rename done above is
-                // a repair of expired one. So on this time we try the intended rename.
+                // Commit the actual rename with the existing lock before we proceed
                 lock.data = Some(LockData::json(src, dst)?);
                 lock = self.update_data(&lock).await?;
-                rename_result = s3.unsafe_rename_obj(src, dst).await;
+            } else {
+                // If lock is not expired, we assume the src and dst has succesully been commited
+                // in the lock data.
+                assert!(data.src == src);
+                assert!(data.dst == dst);
             }
 
-            let release_result = self.release_lock(&lock).await;
+            rename_result = s3.unsafe_rename_obj(src, dst).await;
 
             // before unwrapping `rename_result` the `release_result` is called to ensure that we
             // no longer hold the lock
+            let release_result = self.release_lock(&lock).await;
             rename_result?;
 
             if !release_result? {
